@@ -1,5 +1,5 @@
 {
-  "name": "cash-api",
+  "name": "money-user",
   "version": "4.0.0",
   "description": "Cash API with Upstash Redis",
   "main": "index.js",

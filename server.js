@@ -1,41 +1,39 @@
 const express = require("express");
 const cors = require("cors");
-const { Redis } = require("@upstash/redis");
+const { MongoClient } = require("mongodb");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const redis = new Redis({
-    url: process.env.UPSTASH_REDIS_REST_URL,
-    token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
+const MONGODB_URI = process.env.MONGODB_URI;
+const DB_NAME = "cashdb";
+const COLLECTION_NAME = "users";
 
-const CASH_PREFIX = "cash:";
-const USERS_SET = "cash:users";
+let client = null;
+let db = null;
+let usersCollection = null;
 
-async function getCashString(userId) {
-    try {
-        const raw = await redis.get(`${CASH_PREFIX}${userId}`);
-        if (raw === null || raw === undefined) return "0";
-        if (typeof raw === 'string') return raw;
-        if (typeof raw === 'number') return raw.toString();
-        if (typeof raw === 'object' && raw !== null) return raw.cash?.toString() || "0";
-        return "0";
-    } catch (err) {
-        console.error("[getCashString]", err.message);
-        return "0";
+async function connectToDatabase() {
+    if (db && usersCollection) return { db, usersCollection };
+
+    if (!MONGODB_URI) {
+        throw new Error("MONGODB_URI non configurée");
     }
-}
 
-async function getAllUserIds() {
-    try {
-        const ids = await redis.smembers(USERS_SET);
-        return Array.isArray(ids) ? ids : [];
-    } catch (err) {
-        console.error("[getAllUserIds]", err.message);
-        return [];
-    }
+    client = new MongoClient(MONGODB_URI, {
+        maxPoolSize: 10,
+        serverSelectionTimeoutMS: 5000
+    });
+
+    await client.connect();
+    db = client.db(DB_NAME);
+    usersCollection = db.collection(COLLECTION_NAME);
+
+    await usersCollection.createIndex({ userId: 1 }, { unique: true });
+
+    console.log("[MongoDB] Connecté avec succès");
+    return { db, usersCollection };
 }
 
 function isValidCashString(str) {
@@ -43,87 +41,31 @@ function isValidCashString(str) {
     return /^\d+$/.test(str);
 }
 
+connectToDatabase().catch(err => {
+    console.error("[MongoDB] Erreur de connexion initiale:", err.message);
+});
+
 app.get("/", (req, res) => {
-    res.json({ message: "Cash API opérationnelle", version: "5.2" });
-});
-
-app.get("/api/migrate", async (req, res) => {
-    try {
-        const keys = await redis.keys(`${CASH_PREFIX}*`);
-        let count = 0;
-        for (const key of keys) {
-            const userId = key.replace(CASH_PREFIX, "");
-            if (userId && userId !== "users") {
-                await redis.sadd(USERS_SET, userId);
-                count++;
-            }
-        }
-        res.json({ success: true, migrated: count });
-    } catch (e) {
-        console.error("[migrate]", e.message);
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-app.get("/api/force-migrate", async (req, res) => {
-    try {
-        const keys = await redis.keys(`${CASH_PREFIX}*`);
-        let count = 0;
-        const userIds = [];
-        for (const key of keys) {
-            const userId = key.replace(CASH_PREFIX, "");
-            if (userId && userId !== "users") {
-                userIds.push(userId);
-            }
-        }
-        if (userIds.length > 0) {
-            await redis.sadd(USERS_SET, ...userIds);
-            count = userIds.length;
-        }
-        const check = await redis.smembers(USERS_SET);
-        res.json({
-            success: true,
-            migrated: count,
-            totalInSet: check.length,
-            sample: check.slice(0, 5)
-        });
-    } catch (e) {
-        console.error("[force-migrate]", e.message);
-        res.status(500).json({ success: false, error: e.message });
-    }
+    res.json({ message: "Cash API opérationnelle (MongoDB)", version: "6.0" });
 });
 
 app.get("/api/cash/top", async (req, res) => {
     const limit = Math.max(1, Math.min(100, parseInt(req.query.limit) || 50));
     try {
-        const userIds = await getAllUserIds();
-        if (userIds.length === 0) {
-            return res.json({ success: true, data: [] });
-        }
+        const { usersCollection } = await connectToDatabase();
 
-        const pipeline = redis.pipeline();
-        for (const userId of userIds) {
-            pipeline.get(`${CASH_PREFIX}${userId}`);
-        }
-        const results = await pipeline.exec();
+        const users = await usersCollection
+            .find({})
+            .sort({ cash: -1 })
+            .limit(limit)
+            .toArray();
 
-        const users = userIds.map((userId, i) => {
-            const raw = results[i];
-            let cash = "0";
-            if (raw !== null && raw !== undefined) {
-                if (typeof raw === 'string') cash = raw;
-                else if (typeof raw === 'number') cash = raw.toString();
-                else if (typeof raw === 'object') cash = raw.cash?.toString() || "0";
-            }
-            return { userId, cash };
-        });
+        const data = users.map(u => ({
+            userId: u.userId,
+            cash: u.cash || "0"
+        }));
 
-        users.sort((a, b) => {
-            const diff = BigInt(b.cash) - BigInt(a.cash);
-            return diff > 0n ? 1 : diff < 0n ? -1 : 0;
-        });
-
-        res.json({ success: true, data: users.slice(0, limit) });
+        res.json({ success: true, data });
     } catch (error) {
         console.error("[top]", error.message);
         res.status(500).json({ success: false, error: error.message });
@@ -132,29 +74,16 @@ app.get("/api/cash/top", async (req, res) => {
 
 app.get("/api/cash/users", async (req, res) => {
     try {
-        const userIds = await getAllUserIds();
-        if (userIds.length === 0) {
-            return res.json({ success: true, data: [] });
-        }
+        const { usersCollection } = await connectToDatabase();
 
-        const pipeline = redis.pipeline();
-        for (const userId of userIds) {
-            pipeline.get(`${CASH_PREFIX}${userId}`);
-        }
-        const results = await pipeline.exec();
+        const users = await usersCollection.find({}).toArray();
 
-        const users = userIds.map((userId, i) => {
-            const raw = results[i];
-            let cash = "0";
-            if (raw !== null && raw !== undefined) {
-                if (typeof raw === 'string') cash = raw;
-                else if (typeof raw === 'number') cash = raw.toString();
-                else if (typeof raw === 'object') cash = raw.cash?.toString() || "0";
-            }
-            return { userId, cash };
-        });
+        const data = users.map(u => ({
+            userId: u.userId,
+            cash: u.cash || "0"
+        }));
 
-        res.json({ success: true, data: users });
+        res.json({ success: true, data });
     } catch (error) {
         console.error("[users]", error.message);
         res.status(500).json({ success: false, error: error.message });
@@ -164,8 +93,14 @@ app.get("/api/cash/users", async (req, res) => {
 app.get("/api/cash/:userId", async (req, res) => {
     const { userId } = req.params;
     try {
-        const cashStr = await getCashString(userId);
-        res.json({ success: true, data: { userId, cash: cashStr } });
+        const { usersCollection } = await connectToDatabase();
+
+        const user = await usersCollection.findOne({ userId });
+
+        res.json({
+            success: true,
+            data: { userId, cash: user?.cash || "0" }
+        });
     } catch (error) {
         console.error("[get]", error.message);
         res.status(500).json({ success: false, error: error.message });
@@ -175,11 +110,20 @@ app.get("/api/cash/:userId", async (req, res) => {
 app.post("/api/cash/:userId", async (req, res) => {
     const { userId } = req.params;
     const { cash } = req.body;
-    if (cash === undefined || !isValidCashString(cash.toString()))
+
+    if (cash === undefined || !isValidCashString(cash.toString())) {
         return res.status(400).json({ success: false, error: "Montant invalide" });
+    }
+
     try {
-        await redis.set(`${CASH_PREFIX}${userId}`, cash.toString());
-        await redis.sadd(USERS_SET, userId);
+        const { usersCollection } = await connectToDatabase();
+
+        await usersCollection.updateOne(
+            { userId },
+            { $set: { userId, cash: cash.toString(), updatedAt: new Date() } },
+            { upsert: true }
+        );
+
         res.json({ success: true, data: { userId, cash: cash.toString() } });
     } catch (error) {
         console.error("[set]", error.message);
@@ -190,13 +134,24 @@ app.post("/api/cash/:userId", async (req, res) => {
 app.post("/api/cash/:userId/add", async (req, res) => {
     const { userId } = req.params;
     const { amount } = req.body;
-    if (!amount || !isValidCashString(amount.toString()))
+
+    if (!amount || !isValidCashString(amount.toString())) {
         return res.status(400).json({ success: false, error: "Montant invalide" });
+    }
+
     try {
-        const current = await getCashString(userId);
+        const { usersCollection } = await connectToDatabase();
+
+        const user = await usersCollection.findOne({ userId });
+        const current = user?.cash || "0";
         const newCash = (BigInt(current) + BigInt(amount)).toString();
-        await redis.set(`${CASH_PREFIX}${userId}`, newCash);
-        await redis.sadd(USERS_SET, userId);
+
+        await usersCollection.updateOne(
+            { userId },
+            { $set: { cash: newCash, updatedAt: new Date() } },
+            { upsert: true }
+        );
+
         res.json({ success: true, data: { userId, cash: newCash } });
     } catch (error) {
         console.error("[add]", error.message);
@@ -207,17 +162,30 @@ app.post("/api/cash/:userId/add", async (req, res) => {
 app.post("/api/cash/:userId/subtract", async (req, res) => {
     const { userId } = req.params;
     const { amount } = req.body;
-    if (!amount || !isValidCashString(amount.toString()))
+
+    if (!amount || !isValidCashString(amount.toString())) {
         return res.status(400).json({ success: false, error: "Montant invalide" });
+    }
+
     try {
-        const current = await getCashString(userId);
+        const { usersCollection } = await connectToDatabase();
+
+        const user = await usersCollection.findOne({ userId });
+        const current = user?.cash || "0";
         const bigCurrent = BigInt(current);
         const bigAmount = BigInt(amount);
-        if (bigCurrent < bigAmount)
+
+        if (bigCurrent < bigAmount) {
             return res.status(400).json({ success: false, error: "Solde insuffisant" });
+        }
+
         const newCash = (bigCurrent - bigAmount).toString();
-        await redis.set(`${CASH_PREFIX}${userId}`, newCash);
-        await redis.sadd(USERS_SET, userId);
+
+        await usersCollection.updateOne(
+            { userId },
+            { $set: { cash: newCash, updatedAt: new Date() } }
+        );
+
         res.json({ success: true, data: { userId, cash: newCash } });
     } catch (error) {
         console.error("[subtract]", error.message);
@@ -228,32 +196,32 @@ app.post("/api/cash/:userId/subtract", async (req, res) => {
 app.post("/api/cash/reset-all", async (req, res) => {
     try {
         const { protectedIds = [] } = req.body;
-        const userIds = await getAllUserIds();
+        const { usersCollection } = await connectToDatabase();
+
+        const users = await usersCollection.find({}).toArray();
 
         let resetCount = 0;
         let protectedCount = 0;
         let totalAmount = 0n;
         const details = [];
 
-        for (const userId of userIds) {
-            try {
-                const cashStr = await getCashString(userId);
-                const cash = BigInt(cashStr);
+        for (const user of users) {
+            const cash = BigInt(user.cash || "0");
 
-                if (protectedIds.includes(userId)) {
-                    protectedCount++;
-                    details.push(`🛡️ ${userId} - PROTÉGÉ (${cash.toLocaleString()})`);
-                    continue;
-                }
+            if (protectedIds.includes(user.userId)) {
+                protectedCount++;
+                details.push(`🛡️ ${user.userId} - PROTÉGÉ (${cash.toLocaleString()})`);
+                continue;
+            }
 
-                if (cash > 0n) {
-                    totalAmount += cash;
-                    await redis.set(`${CASH_PREFIX}${userId}`, "0");
-                    resetCount++;
-                    details.push(`✅ ${userId} - ${cash.toLocaleString()} retiré`);
-                }
-            } catch (e) {
-                console.error(`[reset-all] ${userId}:`, e.message);
+            if (cash > 0n) {
+                totalAmount += cash;
+                await usersCollection.updateOne(
+                    { userId: user.userId },
+                    { $set: { cash: "0", updatedAt: new Date() } }
+                );
+                resetCount++;
+                details.push(`✅ ${user.userId} - ${cash.toLocaleString()} retiré`);
             }
         }
 
@@ -262,7 +230,7 @@ app.post("/api/cash/reset-all", async (req, res) => {
             data: {
                 resetCount,
                 protectedCount,
-                totalUsers: userIds.length,
+                totalUsers: users.length,
                 totalAmount: totalAmount.toString(),
                 details: details.slice(0, 50)
             }
@@ -276,9 +244,16 @@ app.post("/api/cash/reset-all", async (req, res) => {
 app.delete("/api/cash/:userId", async (req, res) => {
     const { userId } = req.params;
     try {
-        await redis.del(`${CASH_PREFIX}${userId}`);
-        await redis.srem(USERS_SET, userId);
-        res.json({ success: true, message: `Utilisateur ${userId} supprimé` });
+        const { usersCollection } = await connectToDatabase();
+
+        const result = await usersCollection.deleteOne({ userId });
+
+        res.json({
+            success: true,
+            message: result.deletedCount > 0
+                ? `Utilisateur ${userId} supprimé`
+                : `Utilisateur ${userId} introuvable`
+        });
     } catch (error) {
         console.error("[delete]", error.message);
         res.status(500).json({ success: false, error: error.message });
@@ -295,21 +270,12 @@ app.delete("/api/cash/clear-all", async (req, res) => {
             });
         }
 
-        const userIds = await getAllUserIds();
-        let deleted = 0;
-
-        const pipeline = redis.pipeline();
-        for (const userId of userIds) {
-            pipeline.del(`${CASH_PREFIX}${userId}`);
-        }
-        pipeline.del(USERS_SET);
-        await pipeline.exec();
-
-        deleted = userIds.length;
+        const { usersCollection } = await connectToDatabase();
+        const result = await usersCollection.deleteMany({});
 
         res.json({
             success: true,
-            data: { deleted, message: "Tous les utilisateurs ont été supprimés" }
+            data: { deleted: result.deletedCount, message: "Tous les utilisateurs ont été supprimés" }
         });
     } catch (error) {
         console.error("[clear-all]", error.message);

@@ -44,13 +44,35 @@ function isValidCashString(str) {
 }
 
 app.get("/", (req, res) => {
-    res.json({ message: "Cash API opérationnelle", version: "5.0" });
+    res.json({ message: "Cash API opérationnelle", version: "5.1" });
+});
+
+app.get("/api/migrate", async (req, res) => {
+    try {
+        const keys = await redis.keys(`${CASH_PREFIX}*`);
+        let count = 0;
+        for (const key of keys) {
+            const userId = key.replace(CASH_PREFIX, "");
+            if (userId && userId !== "users") {
+                await redis.sadd(USERS_SET, userId);
+                count++;
+            }
+        }
+        res.json({ success: true, migrated: count });
+    } catch (e) {
+        console.error("[migrate]", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 app.get("/api/cash/top", async (req, res) => {
     const limit = Math.max(1, Math.min(100, parseInt(req.query.limit) || 50));
     try {
         const userIds = await getAllUserIds();
+        if (userIds.length === 0) {
+            return res.json({ success: true, data: [] });
+        }
+
         const pipeline = redis.pipeline();
         for (const userId of userIds) {
             pipeline.get(`${CASH_PREFIX}${userId}`);
@@ -83,6 +105,10 @@ app.get("/api/cash/top", async (req, res) => {
 app.get("/api/cash/users", async (req, res) => {
     try {
         const userIds = await getAllUserIds();
+        if (userIds.length === 0) {
+            return res.json({ success: true, data: [] });
+        }
+
         const pipeline = redis.pipeline();
         for (const userId of userIds) {
             pipeline.get(`${CASH_PREFIX}${userId}`);

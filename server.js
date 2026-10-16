@@ -44,7 +44,7 @@ function isValidCashString(str) {
 }
 
 app.get("/", (req, res) => {
-    res.json({ message: "Cash API opérationnelle", version: "5.1" });
+    res.json({ message: "Cash API opérationnelle", version: "5.2" });
 });
 
 app.get("/api/migrate", async (req, res) => {
@@ -61,6 +61,34 @@ app.get("/api/migrate", async (req, res) => {
         res.json({ success: true, migrated: count });
     } catch (e) {
         console.error("[migrate]", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.get("/api/force-migrate", async (req, res) => {
+    try {
+        const keys = await redis.keys(`${CASH_PREFIX}*`);
+        let count = 0;
+        const userIds = [];
+        for (const key of keys) {
+            const userId = key.replace(CASH_PREFIX, "");
+            if (userId && userId !== "users") {
+                userIds.push(userId);
+            }
+        }
+        if (userIds.length > 0) {
+            await redis.sadd(USERS_SET, ...userIds);
+            count = userIds.length;
+        }
+        const check = await redis.smembers(USERS_SET);
+        res.json({
+            success: true,
+            migrated: count,
+            totalInSet: check.length,
+            sample: check.slice(0, 5)
+        });
+    } catch (e) {
+        console.error("[force-migrate]", e.message);
         res.status(500).json({ success: false, error: e.message });
     }
 });

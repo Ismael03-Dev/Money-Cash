@@ -46,7 +46,7 @@ connectToDatabase().catch(err => {
 });
 
 app.get("/", (req, res) => {
-    res.json({ message: "Cash API opérationnelle (MongoDB)", version: "6.0" });
+    res.json({ message: "Cash API opérationnelle (MongoDB)", version: "6.1" });
 });
 
 app.get("/api/cash/top", async (req, res) => {
@@ -54,13 +54,17 @@ app.get("/api/cash/top", async (req, res) => {
     try {
         const { usersCollection } = await connectToDatabase();
 
-        const users = await usersCollection
-            .find({})
-            .sort({ cash: -1 })
-            .limit(limit)
-            .toArray();
+        const users = await usersCollection.find({}).toArray();
 
-        const data = users.map(u => ({
+        const sortedUsers = users.sort((a, b) => {
+            const cashA = BigInt(a.cash || "0");
+            const cashB = BigInt(b.cash || "0");
+            if (cashA > cashB) return -1;
+            if (cashA < cashB) return 1;
+            return 0;
+        });
+
+        const data = sortedUsers.slice(0, limit).map(u => ({
             userId: u.userId,
             cash: u.cash || "0"
         }));
